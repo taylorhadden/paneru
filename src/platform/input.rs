@@ -52,34 +52,20 @@ pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
     LUA_KEYBINDS.store(Arc::new(keys));
 }
 
-/// How long after a swipe gesture macOS may still be delivering its momentum.
-///
-/// An upper bound, not a blackout: only events the system has *marked* as
-/// momentum are dropped inside it (see [`is_momentum`]), so a deliberate scroll
-/// during the window still goes through. The bound exists so a momentum phase
-/// that never reports its end cannot silence scrolling indefinitely.
+/// Upper bound on how long after a swipe gesture macOS may still be delivering
+/// momentum scroll. Only events marked as momentum are dropped within this
+/// window (see [`is_momentum`]), so a deliberate scroll still goes through.
 const GESTURE_MOMENTUM_WINDOW: Duration = Duration::from_millis(1200);
 
-/// Whether the system tagged this scroll event as momentum — the coasting macOS
-/// synthesises after the fingers leave, rather than anything the user is doing
-/// now.
-///
-/// `kCGScrollWheelEventMomentumPhase` is zero for user-driven scrolling and
-/// non-zero while coasting, which is exactly the distinction the suppression
-/// wants. Timing alone cannot make it: a swipe that lands the pointer on a new
-/// window is immediately followed by the user scrolling *that* window, and to a
-/// clock those are indistinguishable from the tail of the gesture.
+/// Whether the system tagged this scroll event as momentum (the coasting macOS
+/// synthesises after the fingers leave) rather than user-driven scrolling.
 fn is_momentum(event: &CGEvent) -> bool {
     CGEvent::integer_value_field(Some(event), CGEventField::ScrollWheelEventMomentumPhase) != 0
 }
 
-/// Which way a swipe went.
-///
-/// The suppression window exists to stop the momentum scroll macOS keeps
-/// emitting after a gesture from scrolling whatever sits underneath. Momentum
-/// continues along the axis the fingers were already travelling, so that is the
-/// only axis needing silence — blanking both meant a horizontal swipe took
-/// vertical input, workspace switching included, down with it for over a second.
+/// Which way a swipe went. Only the axis the fingers were travelling along
+/// needs momentum suppressed; blanking both would take vertical input down
+/// with a horizontal swipe (workspace switching included).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SwipeAxis {
     Horizontal,
@@ -100,14 +86,9 @@ impl SwipeAxis {
     }
 }
 
-/// One finger, as a single gesture event saw it.
-///
-/// Read out of the `NSTouch` set once per event, because everything below wants
-/// these values several times over and the matching in [`InputHandler::handle_swipe`]
-/// is quadratic in the number of fingers. Reading `identity` and
-/// `normalizedPosition` back through Objective-C inside that loop made the
-/// message count quadratic with it, and re-retained an identity object per
-/// comparison, on every event of every swipe.
+/// One finger, as a single gesture event saw it. Sampled out of the `NSTouch`
+/// set once per event rather than read repeatedly through Objective-C, since
+/// the matching in [`InputHandler::handle_swipe`] is quadratic in finger count.
 struct Touch {
     /// Opaque per-finger token, compared with `isEqual:` to follow one finger
     /// across events. `NSSet` iteration order is not stable, so position in the
@@ -164,14 +145,8 @@ pub(super) struct InputHandler {
     /// momentum that follows finger lift from scrolling what is underneath.
     last_swipe: Option<(Instant, SwipeAxis)>,
     /// The direction the gesture in progress committed to, held until the
-    /// fingers lift.
-    ///
-    /// Deciding this per event instead made a swipe fight itself. Fingers wobble,
-    /// so in the middle of a horizontal swipe individual events do come out
-    /// vertically dominant — and each one either drove the strip the wrong way or,
-    /// with vertical swiping off, fell through to macOS and scrolled whatever was
-    /// underneath. Either way that event's horizontal motion was lost, which is
-    /// the stutter. A swipe picks a direction once and keeps it.
+    /// fingers lift. Decided once per gesture rather than per event, since
+    /// individual events can read vertically dominant mid-horizontal-swipe.
     gesture_axis: Option<SwipeAxis>,
     // Prevents from being Unpin automatically
     _pin: PhantomPinned,
@@ -377,16 +352,6 @@ impl InputHandler {
             CGEventField::ScrollWheelEventFixedPtDeltaAxis1,
         );
 
-        // Drop the momentum macOS keeps synthesising after a gesture, so it does
-        // not scroll whatever the swipe just landed on.
-        //
-        // Three conditions, and all of them earn their place. The event must be
-        // *marked* as momentum, so a scroll the user actually performs is never
-        // swallowed — which is what used to make a window unusable for over a
-        // second after being swiped to. It must run along the axis the gesture
-        // travelled, since that is the only direction momentum carries. And it
-        // must fall inside the window, so a momentum phase that never reports an
-        // end cannot silence that axis forever.
         if let Some((when, axis)) = self.last_swipe
             && when.elapsed() < GESTURE_MOMENTUM_WINDOW
             && axis == SwipeAxis::dominant(h_delta, v_delta)
@@ -520,9 +485,7 @@ impl InputHandler {
 
             if let (Some(axis), Some(events)) = (axis, &self.events) {
                 // Tested on the travel of the whole hand rather than of every
-                // finger. Requiring each one to clear the threshold every event
-                // meant a single finger easing off dropped that event outright,
-                // and its motion with it, which read as the swipe snagging.
+                // finger, so one finger easing off doesn't drop the event.
                 match axis {
                     SwipeAxis::Horizontal if x_sum.abs() > SWIPE_THRESHOLD => {
                         _ = events.send(Event::Swipe {
